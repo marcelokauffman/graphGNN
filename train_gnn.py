@@ -283,17 +283,24 @@ def evaluate(model: ShepherdGAT, data: Data, margin: float, edge_batch_size: int
     return float(loss.item()), float(auc), float(ap)
 
 
-def _ensure_cuda_alloc_conf():
-    """Force a safe allocator config to avoid parsing errors.
-    Some environments set invalid values (e.g., using '=' or duplicate args).
-    To be robust, we unconditionally set a minimal valid config.
+def _ensure_cuda_alloc_conf(user_value: str | None):
+    """Set or unset PYTORCH_CUDA_ALLOC_CONF safely.
+
+    - If user_value is None/''/'unset': remove the variable (use PyTorch defaults).
+    - Else, normalize booleans and set the provided string.
     """
-    os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:true'
+    key = 'PYTORCH_CUDA_ALLOC_CONF'
+    if user_value is None or str(user_value).strip().lower() in ('', 'unset', 'none'):
+        if key in os.environ:
+            os.environ.pop(key, None)
+    else:
+        val = str(user_value).strip().replace('True', 'true').replace('False', 'false').replace(' ', '')
+        os.environ[key] = val
 
 
 def train(args):
     # Sanitize allocator config before any CUDA init
-    _ensure_cuda_alloc_conf()
+    _ensure_cuda_alloc_conf(getattr(args, 'alloc_conf', None))
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     outdir = Path(args.output_dir)
     (outdir / 'checkpoints').mkdir(parents=True, exist_ok=True)
@@ -432,6 +439,7 @@ def build_parser():
     p.add_argument('--edge-batch-size', type=int, default=200_000, help='Edges per batch for loss computation')
     p.add_argument('--metric-max-edges', type=int, default=500_000, help='Max edges sampled for AUC/AP')
     p.add_argument('--amp', type=str, choices=['off','bf16','fp16'], default='bf16', help='Automatic mixed precision for memory/speed (bf16 preferred on Ampere+)')
+    p.add_argument('--alloc-conf', type=str, default='unset', help='Value for PYTORCH_CUDA_ALLOC_CONF (e.g., "expandable_segments:true"), or "unset" to clear')
     return p
 
 
