@@ -284,15 +284,11 @@ def evaluate(model: ShepherdGAT, data: Data, margin: float, edge_batch_size: int
 
 
 def _ensure_cuda_alloc_conf():
-    """Ensure PYTORCH_CUDA_ALLOC_CONF has a valid format to avoid parse errors.
-    If unset or malformed, set a safe default. Also normalize boolean case.
+    """Force a safe allocator config to avoid parsing errors.
+    Some environments set invalid values (e.g., using '=' or duplicate args).
+    To be robust, we unconditionally set a minimal valid config.
     """
-    key = 'PYTORCH_CUDA_ALLOC_CONF'
-    val = os.environ.get(key)
-    if not val or ':' not in val:
-        os.environ[key] = 'expandable_segments:true'
-    else:
-        os.environ[key] = val.replace('True', 'true').replace('False', 'false')
+    os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:true'
 
 
 def train(args):
