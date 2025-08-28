@@ -4,9 +4,10 @@ SHEPHERD GNN training CLI for GPU VM (Runpod-ready).
 
 Implements:
 - Data loader that safely loads .pt dicts saved with pandas DataFrame (PyTorch 2.6 weights_only change)
+- Falls back to NumPy artifacts if torch.load fails due to pandas version mismatches
 - GAT encoder + DistMult decoder with tanh
-- Hinge ranking loss with per-relation negative sampling
-- Checkpointing, metrics, and embeddings export
+- Hinge ranking loss with per-relation negative sampling (edge batching)
+- Checkpointing, metrics logging, and embeddings export
 
 Usage:
   python train_gnn.py --data-dir ./data/graphNN --output-dir ./outputs --epochs 100
@@ -17,7 +18,7 @@ import argparse
 import json
 import time
 from pathlib import Path
-from typing import Dict, Tuple
+from typing import Tuple
 
 import torch
 import torch.nn as nn
@@ -26,6 +27,7 @@ from torch_geometric.data import Data
 from torch_geometric.nn import GATConv
 from sklearn.metrics import roc_auc_score, average_precision_score
 import pandas as pd
+import numpy as np
 
 
 def _safe_torch_load(path: Path):
@@ -49,23 +51,50 @@ class VMKGDataLoader:
         self.data_dir = Path(data_dir)
         with open(self.data_dir / "conversion_summary.json", "r") as f:
             self.summary = json.load(f)
-        # mappings.pkl is a Python pickle (not a torch file)
+        # mappings.pkl is a Python pickle
         import pickle as _pkl
         with open(self.data_dir / "mappings.pkl", "rb") as f:
             self.mappings = _pkl.load(f)
 
     def load_split(self, split: str) -> Data:
-        data_dict = _safe_torch_load(self.data_dir / f"{split}_pyg_data.pt")
-        data = Data(
-            x=data_dict['x'].float(),
-            edge_index=data_dict['edge_index'].long(),
-            edge_attr=data_dict['edge_attr'].long(),
-        )
-        data.num_nodes = int(data_dict['num_nodes'])
-        data.num_edges = int(data_dict['num_edges'])
-        data.num_node_features = int(data_dict['num_node_features'])
-        data.num_relation_types = int(data_dict['num_relation_types'])
-        return data
+        pt_path = self.data_dir / f"{split}_pyg_data.pt"
+        try:
+            data_dict = _safe_torch_load(pt_path)
+            data = Data(
+                x=data_dict['x'].float(),
+                edge_index=data_dict['edge_index'].long(),
+                edge_attr=data_dict['edge_attr'].long(),
+            )
+            data.num_nodes = int(data_dict['num_nodes'])
+            data.num_edges = int(data_dict['num_edges'])
+            data.num_node_features = int(data_dict['num_node_features'])
+            data.num_relation_types = int(data_dict['num_relation_types'])
+            return data
+        except Exception as e:
+            print(f"⚠️ Failed to load {pt_path} via torch.load due to: {e}\n   Falling back to NumPy files (edges/features).")
+            # Fallback: rebuild from numpy artifacts
+            edges_path = self.data_dir / f"{split}_edges.npy"
+            x_path = self.data_dir / "node_features.npy"
+            if not edges_path.exists() or not x_path.exists():
+                raise FileNotFoundError(
+                    f"Missing fallback files: {edges_path} and/or {x_path}."
+                )
+            edges = np.load(edges_path)  # shape (E, 3): src, dst, rel_idx
+            if edges.ndim != 2 or edges.shape[1] < 3:
+                raise ValueError(f"Unexpected edges shape: {edges.shape}")
+            x = np.load(x_path).astype(np.float32)
+            edge_index = torch.tensor(edges[:, :2].T, dtype=torch.long)
+            edge_attr = torch.tensor(edges[:, 2].copy(), dtype=torch.long)
+            data = Data(
+                x=torch.tensor(x, dtype=torch.float32),
+                edge_index=edge_index,
+                edge_attr=edge_attr,
+            )
+            data.num_nodes = int(x.shape[0])
+            data.num_edges = int(edges.shape[0])
+            data.num_node_features = int(x.shape[1])
+            data.num_relation_types = int(self.summary.get('relation_types', len(self.mappings.get('relation_to_idx', {}))))
+            return data
 
 
 class ShepherdGAT(nn.Module):
@@ -189,7 +218,6 @@ def link_prediction_hinge_loss(
 
     Also computes AUC/AP on up to metric_max_edges edges for speed.
     """
-    device = data.edge_index.device
     node_embeddings = model(data)
 
     E = data.edge_index.size(1)
@@ -198,7 +226,6 @@ def link_prediction_hinge_loss(
 
     total_loss = 0.0
     n_batches = 0
-    # For metrics, accumulate subset
     metric_pos = []
     metric_neg = []
 
@@ -214,8 +241,7 @@ def link_prediction_hinge_loss(
         total_loss += batch_loss
         n_batches += 1
 
-        # Sample for metrics if needed
-        if len(metric_pos) * 1 < metric_max_edges:
+        if len(metric_pos) < (metric_max_edges // max(1, (end-start))):
             metric_pos.append(pos_scores.detach())
             metric_neg.append(neg_scores.detach())
 
@@ -225,9 +251,8 @@ def link_prediction_hinge_loss(
         if metric_pos:
             pos_scores = torch.cat(metric_pos)
             neg_scores = torch.cat(metric_neg)
-            if pos_scores.numel() > metric_max_edges:
-                pos_scores = pos_scores[:metric_max_edges]
-                neg_scores = neg_scores[:metric_max_edges]
+            pos_scores = pos_scores[:metric_max_edges]
+            neg_scores = neg_scores[:metric_max_edges]
             pos_p = (pos_scores + 1) / 2
             neg_p = (neg_scores + 1) / 2
             probs = torch.cat([pos_p, neg_p]).clamp(0, 1)
@@ -303,10 +328,8 @@ def train(args):
         history["train_auc"].append(float(auc))
         history["val_auc"].append(float(vauc))
 
-        # Log to console every 5 epochs and initially
         if (epoch % 5 == 0) or (epoch < 10):
             print(f"Epoch {epoch:03d} | train loss {loss:.4f} | val loss {vloss:.4f} | train AUC {auc:.4f} | val AUC {vauc:.4f}")
-        # Append per-epoch metrics (tail -f friendly)
         with open(metrics_log, 'a') as f:
             lr_cur = float(optim.param_groups[0]['lr'])
             f.write(f"{epoch},{float(loss.item()):.6f},{float(vloss):.6f},{float(auc):.6f},{float(vauc):.6f},{lr_cur:.6e}\n")
@@ -331,11 +354,9 @@ def train(args):
     dur = (time.time() - start) / 60
     print(f"Training finished in {dur:.1f} min | best val loss {best_val:.4f}")
 
-    # Save history
     with open(outdir / 'results' / 'training_history.json', 'w') as f:
         json.dump(history, f, indent=2)
 
-    # Final test
     tloss, tauc, tap = evaluate(
         model, test_data, args.margin, edge_batch_size=args.edge_batch_size, metric_max_edges=args.metric_max_edges
     )
@@ -344,7 +365,6 @@ def train(args):
     with open(outdir / 'results' / 'final_results.json', 'w') as f:
         json.dump({"test_metrics": final, "config": vars(args)}, f, indent=2)
 
-    # Export embeddings
     model.eval()
     with torch.no_grad():
         emb = model(train_data)
@@ -353,7 +373,7 @@ def train(args):
 
 def build_parser():
     p = argparse.ArgumentParser(description="SHEPHERD GNN training (VM)")
-    p.add_argument('--data-dir', required=True, help='Path with *_pyg_data.pt and mappings')
+    p.add_argument('--data-dir', required=True, help='Path with *_pyg_data.pt and/or *_edges.npy + node_features.npy')
     p.add_argument('--output-dir', default='./outputs', help='Where to write checkpoints/results')
     p.add_argument('--epochs', type=int, default=100)
     p.add_argument('--patience', type=int, default=15)
@@ -373,3 +393,4 @@ def build_parser():
 if __name__ == '__main__':
     args = build_parser().parse_args()
     train(args)
+
