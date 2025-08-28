@@ -17,6 +17,8 @@ from __future__ import annotations
 import argparse
 import json
 import time
+import os
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Tuple
 
@@ -315,19 +317,42 @@ def train(args):
     with open(metrics_log, 'w') as f:
         f.write('epoch,train_loss,val_loss,train_auc,val_auc,lr\n')
 
+    # Autocast + scaler setup
+    if args.amp != 'off' and torch.cuda.is_available():
+        if args.amp == 'bf16' and torch.cuda.is_bf16_supported():
+            amp_cm = torch.cuda.amp.autocast(dtype=torch.bfloat16)
+            scaler = None
+        elif args.amp == 'fp16':
+            amp_cm = torch.cuda.amp.autocast(dtype=torch.float16)
+            scaler = torch.cuda.amp.GradScaler()
+        else:
+            amp_cm = nullcontext()
+            scaler = None
+    else:
+        amp_cm = nullcontext()
+        scaler = None
+
     for epoch in range(args.epochs):
         model.train()
         optim.zero_grad()
-        loss, auc, ap = link_prediction_hinge_loss(
-            model, train_data, args.margin, edge_batch_size=args.edge_batch_size, metric_max_edges=args.metric_max_edges, neg_mult=args.neg_mult
-        )
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        optim.step()
+        with amp_cm:
+            loss, auc, ap = link_prediction_hinge_loss(
+                model, train_data, args.margin, edge_batch_size=args.edge_batch_size, metric_max_edges=args.metric_max_edges, neg_mult=args.neg_mult
+            )
+        if scaler is not None:
+            scaler.scale(loss).backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            scaler.step(optim)
+            scaler.update()
+        else:
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optim.step()
 
-        vloss, vauc, vap = evaluate(
-            model, val_data, args.margin, edge_batch_size=args.edge_batch_size, metric_max_edges=args.metric_max_edges, neg_mult=args.neg_mult
-        )
+        with amp_cm:
+            vloss, vauc, vap = evaluate(
+                model, val_data, args.margin, edge_batch_size=args.edge_batch_size, metric_max_edges=args.metric_max_edges, neg_mult=args.neg_mult
+            )
         sched.step(vloss)
 
         history["train_loss"].append(float(loss.item()))
@@ -364,9 +389,10 @@ def train(args):
     with open(outdir / 'results' / 'training_history.json', 'w') as f:
         json.dump(history, f, indent=2)
 
-    tloss, tauc, tap = evaluate(
-        model, test_data, args.margin, edge_batch_size=args.edge_batch_size, metric_max_edges=args.metric_max_edges, neg_mult=args.neg_mult
-    )
+    with amp_cm:
+        tloss, tauc, tap = evaluate(
+            model, test_data, args.margin, edge_batch_size=args.edge_batch_size, metric_max_edges=args.metric_max_edges, neg_mult=args.neg_mult
+        )
     final = {"loss": tloss, "auc": tauc, "average_precision": tap}
     print(f"Test: loss {tloss:.4f} | AUC {tauc:.4f} | AP {tap:.4f}")
     with open(outdir / 'results' / 'final_results.json', 'w') as f:
@@ -395,6 +421,7 @@ def build_parser():
     p.add_argument('--neg-mult', type=float, default=1.0, help='Negatives per positive ratio in each edge batch')
     p.add_argument('--edge-batch-size', type=int, default=200_000, help='Edges per batch for loss computation')
     p.add_argument('--metric-max-edges', type=int, default=500_000, help='Max edges sampled for AUC/AP')
+    p.add_argument('--amp', type=str, choices=['off','bf16','fp16'], default='bf16', help='Automatic mixed precision for memory/speed (bf16 preferred on Ampere+)')
     return p
 
 
