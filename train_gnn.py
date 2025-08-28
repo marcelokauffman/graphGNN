@@ -283,7 +283,21 @@ def evaluate(model: ShepherdGAT, data: Data, margin: float, edge_batch_size: int
     return float(loss.item()), float(auc), float(ap)
 
 
+def _ensure_cuda_alloc_conf():
+    """Ensure PYTORCH_CUDA_ALLOC_CONF has a valid format to avoid parse errors.
+    If unset or malformed, set a safe default. Also normalize boolean case.
+    """
+    key = 'PYTORCH_CUDA_ALLOC_CONF'
+    val = os.environ.get(key)
+    if not val or ':' not in val:
+        os.environ[key] = 'expandable_segments:true'
+    else:
+        os.environ[key] = val.replace('True', 'true').replace('False', 'false')
+
+
 def train(args):
+    # Sanitize allocator config before any CUDA init
+    _ensure_cuda_alloc_conf()
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     outdir = Path(args.output_dir)
     (outdir / 'checkpoints').mkdir(parents=True, exist_ok=True)
