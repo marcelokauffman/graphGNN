@@ -234,19 +234,23 @@ def link_prediction_hinge_loss(
         end = min(E, start + edge_batch_size)
         pos_idx = data.edge_index[:, start:end]
         pos_rel = data.edge_attr[start:end]
-        # scale number of negatives per batch by neg_mult
-        n_neg = int(max(1, (end - start) * float(neg_mult)))
+        # Use integer negatives-per-positive (k)
+        P = end - start
+        k = max(1, int(round(float(neg_mult))))
+        n_neg = P * k
         neg_idx, neg_rel = create_negative_triples(pos_idx, pos_rel, data.num_nodes, num_neg=n_neg)
 
-        pos_scores = distmult_scores(node_embeddings, model.relation_embedding.weight, pos_idx, pos_rel)
-        neg_scores = distmult_scores(node_embeddings, model.relation_embedding.weight, neg_idx, neg_rel)
-        batch_loss = F.relu(margin - pos_scores + neg_scores).mean()
+        pos_scores = distmult_scores(node_embeddings, model.relation_embedding.weight, pos_idx, pos_rel)  # [P]
+        neg_scores = distmult_scores(node_embeddings, model.relation_embedding.weight, neg_idx, neg_rel)  # [P*k]
+        # Reshape negatives to [P, k] and compute hinge per (pos, neg)
+        neg_scores = neg_scores.view(P, k)
+        batch_loss = F.relu(margin - pos_scores.unsqueeze(1) + neg_scores).mean()
         total_loss += batch_loss
         n_batches += 1
 
-        if len(metric_pos) < (metric_max_edges // max(1, (end-start))):
-            metric_pos.append(pos_scores.detach())
-            metric_neg.append(neg_scores.detach())
+        # For metrics, repeat positives to match negatives count
+        metric_pos.append(pos_scores.detach().repeat_interleave(k))  # [P*k]
+        metric_neg.append(neg_scores.detach().reshape(-1))           # [P*k]
 
     loss = total_loss / max(1, n_batches)
 
