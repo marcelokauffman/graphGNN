@@ -213,6 +213,7 @@ def link_prediction_hinge_loss(
     num_neg: int | None = None,
     edge_batch_size: int = 200_000,
     metric_max_edges: int = 500_000,
+    neg_mult: float = 1.0,
 ):
     """Compute hinge loss in edge batches to keep memory bounded.
 
@@ -233,7 +234,9 @@ def link_prediction_hinge_loss(
         end = min(E, start + edge_batch_size)
         pos_idx = data.edge_index[:, start:end]
         pos_rel = data.edge_attr[start:end]
-        neg_idx, neg_rel = create_negative_triples(pos_idx, pos_rel, data.num_nodes, num_neg=end-start)
+        # scale number of negatives per batch by neg_mult
+        n_neg = int(max(1, (end - start) * float(neg_mult)))
+        neg_idx, neg_rel = create_negative_triples(pos_idx, pos_rel, data.num_nodes, num_neg=n_neg)
 
         pos_scores = distmult_scores(node_embeddings, model.relation_embedding.weight, pos_idx, pos_rel)
         neg_scores = distmult_scores(node_embeddings, model.relation_embedding.weight, neg_idx, neg_rel)
@@ -266,10 +269,10 @@ def link_prediction_hinge_loss(
 
 
 @torch.no_grad()
-def evaluate(model: ShepherdGAT, data: Data, margin: float, edge_batch_size: int = 200_000, metric_max_edges: int = 500_000):
+def evaluate(model: ShepherdGAT, data: Data, margin: float, edge_batch_size: int = 200_000, metric_max_edges: int = 500_000, neg_mult: float = 1.0):
     model.eval()
     loss, auc, ap = link_prediction_hinge_loss(
-        model, data, margin, edge_batch_size=edge_batch_size, metric_max_edges=metric_max_edges
+        model, data, margin, edge_batch_size=edge_batch_size, metric_max_edges=metric_max_edges, neg_mult=neg_mult
     )
     return float(loss.item()), float(auc), float(ap)
 
@@ -312,14 +315,14 @@ def train(args):
         model.train()
         optim.zero_grad()
         loss, auc, ap = link_prediction_hinge_loss(
-            model, train_data, args.margin, edge_batch_size=args.edge_batch_size, metric_max_edges=args.metric_max_edges
+            model, train_data, args.margin, edge_batch_size=args.edge_batch_size, metric_max_edges=args.metric_max_edges, neg_mult=args.neg_mult
         )
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optim.step()
 
         vloss, vauc, vap = evaluate(
-            model, val_data, args.margin, edge_batch_size=args.edge_batch_size, metric_max_edges=args.metric_max_edges
+            model, val_data, args.margin, edge_batch_size=args.edge_batch_size, metric_max_edges=args.metric_max_edges, neg_mult=args.neg_mult
         )
         sched.step(vloss)
 
@@ -358,7 +361,7 @@ def train(args):
         json.dump(history, f, indent=2)
 
     tloss, tauc, tap = evaluate(
-        model, test_data, args.margin, edge_batch_size=args.edge_batch_size, metric_max_edges=args.metric_max_edges
+        model, test_data, args.margin, edge_batch_size=args.edge_batch_size, metric_max_edges=args.metric_max_edges, neg_mult=args.neg_mult
     )
     final = {"loss": tloss, "auc": tauc, "average_precision": tap}
     print(f"Test: loss {tloss:.4f} | AUC {tauc:.4f} | AP {tap:.4f}")
@@ -385,6 +388,7 @@ def build_parser():
     p.add_argument('--num-heads', type=int, default=8)
     p.add_argument('--num-layers', type=int, default=3)
     p.add_argument('--dropout', type=float, default=0.1)
+    p.add_argument('--neg-mult', type=float, default=1.0, help='Negatives per positive ratio in each edge batch')
     p.add_argument('--edge-batch-size', type=int, default=200_000, help='Edges per batch for loss computation')
     p.add_argument('--metric-max-edges', type=int, default=500_000, help='Max edges sampled for AUC/AP')
     return p
@@ -393,4 +397,3 @@ def build_parser():
 if __name__ == '__main__':
     args = build_parser().parse_args()
     train(args)
-
